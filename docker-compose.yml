@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    image: hpack-relay-review
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # 验收：连续解码规则代码测试 + 页面构建检查 + 页面/健康路径 HTTP 冒烟。
+  # 完成后退出，退出码即验收结果（0 通过，1 失败）。
+  # 用法：docker compose run --rm verify   或   docker compose up --abort-on-container-exit verify
+  verify:
+    build: .
+    image: hpack-relay-review
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: http://app:8080
+    command: ["node", "scripts/verify.js"]

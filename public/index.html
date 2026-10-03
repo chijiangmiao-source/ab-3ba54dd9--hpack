@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>星载中继网关 · HPACK 连续解码复核台</title>
+<!--BUILD_STAMP-->
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #e6edf3;
+    --muted: #8b949e; --accent: #58a6ff; --ok: #3fb950; --err: #f85149;
+    --warn: #d29922; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border);
+           display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  header a { color: var(--accent); text-decoration: none; margin-left: auto; font-size: 13px; }
+  main { padding: 20px 24px; max-width: 1180px; margin: 0 auto; }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 12px; font-size: 15px; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  label { color: var(--muted); font-size: 13px; }
+  input[type=number] { width: 110px; background: var(--bg); color: var(--fg);
+                       border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+  .blocks { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 900px) { .blocks { grid-template-columns: 1fr; } }
+  .blk label { display: flex; justify-content: space-between; margin-bottom: 4px; }
+  .blk .meta { font-family: var(--mono); font-size: 12px; }
+  .blk .meta.bad { color: var(--err); }
+  textarea { width: 100%; min-height: 64px; resize: vertical; background: var(--bg);
+             color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
+             padding: 8px; font-family: var(--mono); font-size: 12px; }
+  textarea:focus, input:focus { outline: 1px solid var(--accent); }
+  button { background: #21262d; color: var(--fg); border: 1px solid var(--border);
+           border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 14px; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button:hover { filter: brightness(1.2); }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px;
+           font-size: 12px; font-weight: 600; }
+  .badge.ok { background: rgba(63,185,80,.15); color: var(--ok); }
+  .badge.error { background: rgba(248,81,73,.15); color: var(--err); }
+  .badge.skipped { background: rgba(139,148,158,.15); color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border);
+           vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+  .err-box { border: 1px solid var(--err); border-radius: 6px; padding: 10px 12px;
+             background: rgba(248,81,73,.08); margin: 8px 0; }
+  .note { color: var(--muted); font-size: 13px; }
+  .stale { color: var(--warn); font-size: 13px; }
+  h3 { font-size: 13px; color: var(--muted); margin: 14px 0 4px; }
+  .empty { color: var(--muted); font-size: 13px; padding: 4px 0; }
+  #summary { border-left: 3px solid var(--accent); }
+  #summary.fail { border-left-color: var(--err); }
+  details { margin-top: 6px; }
+  summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>星载中继网关 · HPACK 连续解码复核台</h1>
+  <span class="sub">按接收顺序复核 1–8 段 HTTP/2 头块，动态表全程延续</span>
+  <a href="/health" target="_blank" rel="noopener">健康检查 /health</a>
+</header>
+<main>
+  <section class="panel">
+    <h2>复核输入</h2>
+    <div class="row" style="margin-bottom:12px">
+      <label for="tableSize">动态表容量上限（0–4096 字节）</label>
+      <input type="number" id="tableSize" min="0" max="4096" step="1" value="4096">
+      <span class="note">输入总量上限 64KiB；单次 1–8 段；容量更新必须位于块首</span>
+    </div>
+    <div class="blocks" id="blocks"></div>
+    <div class="row" style="margin-top:14px">
+      <button class="primary" id="decodeBtn">开始复核</button>
+      <button id="clearDraftBtn">清空草稿</button>
+      <button id="clearResultBtn">清除结论</button>
+      <span id="staleHint" class="stale" hidden>输入已变更，旧结论已清除</span>
+    </div>
+  </section>
+
+  <section class="panel" id="summary" hidden></section>
+  <section id="results"></section>
+</main>
+
+<script>
+'use strict';
+
+var MAX_BLOCKS = 8;
+var blocksEl = document.getElementById('blocks');
+var resultsEl = document.getElementById('results');
+var summaryEl = document.getElementById('summary');
+var staleHint = document.getElementById('staleHint');
+var tableSizeEl = document.getElementById('tableSize');
+
+// --- 输入区 ----------------------------------------------------------------
+
+for (var i = 0; i < MAX_BLOCKS; i++) {
+  var div = document.createElement('div');
+  div.className = 'blk';
+  div.innerHTML =
+    '<label>第 ' + (i + 1) + ' 段（Base64）<span class="meta" id="meta' + i + '"></span></label>' +
+    '<textarea id="blk' + i + '" spellcheck="false" placeholder="留空表示该段不参与复核"></textarea>';
+  blocksEl.appendChild(div);
+}
+
+function b64DecodedLength(s) {
+  var cleaned = s.replace(/\s+/g, '');
+  if (!cleaned) return 0;
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(cleaned)) return -1;
+  var pad = cleaned.endsWith('==') ? 2 : (cleaned.endsWith('=') ? 1 : 0);
+  return cleaned.length / 4 * 3 - pad;
+}
+
+function refreshMeta() {
+  var total = 0;
+  for (var i = 0; i < MAX_BLOCKS; i++) {
+    var ta = document.getElementById('blk' + i);
+    var meta = document.getElementById('meta' + i);
+    var n = b64DecodedLength(ta.value);
+    if (!ta.value.trim()) { meta.textContent = ''; meta.className = 'meta'; continue; }
+    if (n < 0) { meta.textContent = 'Base64 非法'; meta.className = 'meta bad'; }
+    else {
+      meta.textContent = n + ' 字节'; meta.className = 'meta';
+      total += n;
+      if (total > 65536) { meta.textContent = n + ' 字节（总量超 64KiB）'; meta.className = 'meta bad'; }
+    }
+  }
+}
+
+// 输入一旦变更，旧结论（尤其是成功结论）立即失效并清除
+function onInputChange() {
+  clearResults();
+  staleHint.hidden = false;
+  refreshMeta();
+}
+
+blocksEl.addEventListener('input', onInputChange);
+tableSizeEl.addEventListener('input', onInputChange);
+
+document.getElementById('clearDraftBtn').addEventListener('click', function () {
+  for (var i = 0; i < MAX_BLOCKS; i++) document.getElementById('blk' + i).value = '';
+  tableSizeEl.value = '4096';
+  clearResults();
+  staleHint.hidden = true;
+  refreshMeta();
+});
+
+document.getElementById('clearResultBtn').addEventListener('click', function () {
+  clearResults();
+  staleHint.hidden = true;
+});
+
+function clearResults() {
+  resultsEl.innerHTML = '';
+  summaryEl.hidden = true;
+  summaryEl.innerHTML = '';
+}
+
+// --- 展示辅助 ---------------------------------------------------------------
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+// 字段名/值按字节串处理：不可打印字符转义显示
+function showBytes(s) {
+  var out = '';
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    out += (c >= 0x20 && c < 0x7f) ? s[i] : '\\x' + (c < 16 ? '0' : '') + c.toString(16);
+  }
+  return esc(out);
+}
+
+function refText(ref) {
+  if (!ref) return '—';
+  if (ref.source === 'static') return '静态表 #' + ref.index;
+  if (ref.source === 'dynamic') {
+    return '动态表 #' + ref.index + (ref.origin !== undefined ? '（第 ' + (ref.origin + 1) + ' 段插入）' : '');
+  }
+  return '字面量' + (ref.huffman ? '（Huffman）' : '');
+}
+
+var REPR_NAMES = {
+  indexed: '索引',
+  incremental: '字面量·增量索引',
+  without_indexing: '字面量·不索引',
+  never_indexed: '字面量·永不索引'
+};
+
+function tableHtml(headers, rows) {
+  if (!rows.length) return '<div class="empty">（无）</div>';
+  var h = '<table><thead><tr>' + headers.map(function (x) { return '<th>' + x + '</th>'; }).join('') +
+    '</tr></thead><tbody>';
+  rows.forEach(function (r) {
+    h += '<tr>' + r.map(function (c) { return '<td class="mono">' + c + '</td>'; }).join('') + '</tr>';
+  });
+  return h + '</tbody></table>';
+}
+
+function snapshotHtml(snap) {
+  var head = '<div class="note">段末动态表：' + snap.entries.length + ' 项，' +
+    snap.size + ' / ' + snap.maxSize + ' 字节</div>';
+  var rows = snap.entries.map(function (e) {
+    return ['#' + e.index, showBytes(e.name), showBytes(e.value), e.size + ' B', '第 ' + (e.origin + 1) + ' 段'];
+  });
+  return head + tableHtml(['索引', '名称', '值', '大小', '插入于'], rows);
+}
+
+// --- 复核执行 ---------------------------------------------------------------
+
+document.getElementById('decodeBtn').addEventListener('click', function () {
+  clearResults();
+  staleHint.hidden = true;
+
+  var blocks = [];
+  for (var i = 0; i < MAX_BLOCKS; i++) {
+    var v = document.getElementById('blk' + i).value.replace(/\s+/g, '');
+    if (v) blocks.push(v);
+  }
+  if (!blocks.length) {
+    renderError('至少需要粘贴 1 段 Base64 编码的 HPACK 块');
+    return;
+  }
+  var tableSize = parseInt(tableSizeEl.value, 10);
+
+  fetch('/api/decode', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ tableSize: tableSize, blocks: blocks })
+  }).then(function (res) {
+    return res.json().then(function (data) { return { status: res.status, data: data }; });
+  }).then(function (r) {
+    if (r.status !== 200) {
+      renderError('请求被拒绝：' + (r.data.error ? esc(r.data.error.message) : r.status));
+      return;
+    }
+    render(r.data);
+  }).catch(function (e) {
+    renderError('复核请求失败：' + esc(e.message));
+  });
+});
+
+function renderError(msg) {
+  summaryEl.hidden = false;
+  summaryEl.className = 'panel fail';
+  summaryEl.id = 'summary';
+  summaryEl.innerHTML = '<span class="badge error">失败</span> <span class="mono">' + msg + '</span>';
+}
+
+function render(data) {
+  var s = data.summary;
+  summaryEl.hidden = false;
+  summaryEl.className = 'panel' + (data.ok ? '' : ' fail');
+  summaryEl.innerHTML =
+    '<span class="badge ' + (data.ok ? 'ok' : 'error') + '">' +
+    (data.ok ? '全部块解码成功' : '第 ' + (s.failedBlock + 1) + ' 段解码失败') + '</span>' +
+    '<div class="note" style="margin-top:8px">字段 ' + s.totalFields + ' 个 · 插入 ' +
+    s.totalInsertions + ' 项 · 驱逐 ' + s.totalEvictions + ' 项 · 最终动态表 ' +
+    data.finalTable.entries.length + ' 项（' + data.finalTable.size + ' / ' +
+    data.finalTable.maxSize + ' 字节）' +
+    (data.ok ? '' : ' · 失败块未改变已提交表状态') + '</div>';
+
+  data.blocks.forEach(function (b) {
+    var card = document.createElement('section');
+    card.className = 'panel';
+    var html = '<h2>第 ' + (b.index + 1) + ' 段 <span class="badge ' + b.status + '">' +
+      (b.status === 'ok' ? '成功' : b.status === 'error' ? '失败' : '未解码') + '</span>' +
+      ' <span class="note mono">' + b.bytes + ' 字节</span></h2>';
+
+    if (b.status === 'error') {
+      html += '<div class="err-box">块内字节偏移 <b class="mono">' + b.error.offset + '</b> · ' +
+        '<span class="mono">' + esc(b.error.code) + '</span> · ' + esc(b.error.message) +
+        '<div class="note">该块已整体作废，动态表保持上一成功段快照。</div></div>';
+    }
+    if (b.status === 'skipped') {
+      html += '<div class="note">因前序块失败，本段未解码。</div>';
+    }
+    if (b.status === 'ok') {
+      if (b.sizeUpdates.length) {
+        html += '<h3>容量更新</h3>' + tableHtml(['偏移', '新容量'],
+          b.sizeUpdates.map(function (u) { return [u.offset, u.size + ' B']; }));
+      }
+      html += '<h3>字段（' + b.fields.length + '）</h3>' + tableHtml(
+        ['偏移', '表示法', '名称', '值', '名称来源', '值来源'],
+        b.fields.map(function (f) {
+          return [f.offset, REPR_NAMES[f.representation] || f.representation,
+            showBytes(f.name), showBytes(f.value), refText(f.nameRef), refText(f.valueRef)];
+        }));
+      html += '<details><summary>插入记录（' + b.insertions.length + '）/ 驱逐记录（' +
+        b.evictions.length + '）</summary>' +
+        '<h3>插入记录</h3>' + tableHtml(['偏移', '索引', '名称', '值', '大小', '结果'],
+          b.insertions.map(function (x) {
+            return [x.offset, '#' + x.index, showBytes(x.name), showBytes(x.value),
+              x.size + ' B', x.inserted ? '已入表' : '超容量未入表'];
+          })) +
+        '<h3>驱逐记录</h3>' + tableHtml(['名称', '值', '大小', '原插入段'],
+          b.evictions.map(function (x) {
+            return [showBytes(x.name), showBytes(x.value), x.size + ' B', '第 ' + (x.origin + 1) + ' 段'];
+          })) + '</details>';
+    }
+    if (b.snapshot) {
+      html += '<details><summary>段末动态表快照</summary>' + snapshotHtml(b.snapshot) + '</details>';
+    }
+    card.innerHTML = html;
+    resultsEl.appendChild(card);
+  });
+}
+
+refreshMeta();
+</script>
+</body>
+</html>
